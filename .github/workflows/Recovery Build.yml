@@ -1,4 +1,4 @@
-name: Recovery Build
+name: TWRP Recovery Build - Motorola Capri
 
 on:
   workflow_dispatch:
@@ -26,9 +26,11 @@ on:
       COMMON_TREE_URL:
         description: 'COMMON_TREE_URL (if no common tree, leave blank)'
         required: false
+        default: 'https://github.com/motorola/capri-common'
       COMMON_PATH:
         description: 'COMMON_PATH (if no common tree, leave blank)'
         required: false
+        default: 'device/motorola/capri-common'
       DEVICE_NAME:
         description: 'DEVICE_NAME'
         required: true
@@ -40,7 +42,12 @@ on:
       BUILD_TARGET:
         description: 'BUILD_TARGET'
         required: true
-        default: 'boot'
+        default: 'recovery'
+      DEBUG_MODE:
+        description: 'Enable debug mode for troubleshooting'
+        required: false
+        default: 'true'
+        type: boolean
 
 jobs:
   build:
@@ -60,6 +67,7 @@ jobs:
         echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
         echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
         echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
+        echo "Debug Mode: ${{ github.event.inputs.DEBUG_MODE }}"
         echo "::endgroup::"
 
     # You might want to Checkout your repo first, but not mandatory
@@ -109,8 +117,8 @@ jobs:
         mkdir workspace
         cd workspace
         echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
-        git config --global user.name "Nico170420"
-        git config --global user.email "b170420nc@gmail.com"
+        git config --global user.name "TWRP-Builder"
+        git config --global user.email "builder@twrp.local"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
       id: pwd
 
@@ -132,6 +140,20 @@ jobs:
         git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
+    - name: Debug - Check Device Tree Structure
+      if: ${{ github.event.inputs.DEBUG_MODE == 'true' }}
+      run: |
+        echo "::group::Device Tree Structure Check"
+        ls -la ${{ github.event.inputs.DEVICE_PATH }}/
+        echo "--- BoardConfig.mk content ---"
+        head -20 ${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk
+        echo "--- device.mk content ---"
+        head -20 ${{ github.event.inputs.DEVICE_PATH }}/device.mk
+        echo "--- Recovery structure ---"
+        find ${{ github.event.inputs.DEVICE_PATH }}/recovery -type f | head -10
+        echo "::endgroup::"
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
     - name: Check Build Tree
       uses: haya14busa/action-cond@v1
       id: buildtree
@@ -142,21 +164,69 @@ jobs:
 
     - name: Sync Device Dependencies
       run: |
-        bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
-        repo sync -j$(nproc --all)
+        if [ -f "${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies" ]; then
+          echo "Found dependencies file, converting..."
+          bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
+          repo sync -j$(nproc --all)
+        else
+          echo "No dependencies file found, skipping..."
+        fi
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
+
+    - name: Debug - Check Dependencies
+      if: ${{ github.event.inputs.DEBUG_MODE == 'true' }}
+      run: |
+        echo "::group::Dependencies Check"
+        if [ -f ".repo/local_manifests/roomservice.xml" ]; then
+          echo "Local manifest content:"
+          cat .repo/local_manifests/roomservice.xml
+        else
+          echo "No local manifest found"
+        fi
+        echo "::endgroup::"
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Set Swap Space
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 12
 
+    - name: Debug - Environment Setup
+      if: ${{ github.event.inputs.DEBUG_MODE == 'true' }}
+      run: |
+        echo "::group::Environment Setup"
+        source build/envsetup.sh
+        echo "Environment setup completed"
+        echo "Available products:"
+        get_build_var TARGET_DEVICE || echo "No TARGET_DEVICE found"
+        echo "::endgroup::"
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
     - name: Building recovery
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        export BUILD_BROKEN_DUP_RULES=true
+        export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
+        echo "Starting build for ${{ github.event.inputs.MAKEFILE_NAME }}"
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        echo "Lunch completed, starting make..."
+        make clean
+        echo "Clean completed, building ${{ github.event.inputs.BUILD_TARGET }}image..."
+        make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        echo "Build completed!"
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Debug - Build Output Check
+      if: ${{ github.event.inputs.DEBUG_MODE == 'true' }}
+      run: |
+        echo "::group::Build Output Check"
+        echo "Checking for build artifacts..."
+        find out/target/product/${{ github.event.inputs.DEVICE_NAME }} -name "*.img" -o -name "*.zip" | head -10
+        echo "Build log summary:"
+        tail -50 out/error.log 2>/dev/null || echo "No error log found"
+        echo "::endgroup::"
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Upload to Release
@@ -169,8 +239,26 @@ jobs:
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
-          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: ${{ github.event.inputs.BUILD_TARGET }}.img
+          **TWRP Recovery Build for Motorola Capri**
+          
+          **Build Information:**
+          - Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          - Device: ${{ github.event.inputs.DEVICE_NAME }}
+          - Target: ${{ github.event.inputs.BUILD_TARGET }}.img
+          - Debug Mode: ${{ github.event.inputs.DEBUG_MODE }}
+          
+          **Device Specifications:**
+          - Platform: Qualcomm Snapdragon 460 (bengal)
+          - Architecture: ARM64
+          - Android: 12.1 (API 31)
+          
+          **Features:**
+          - A/B Partition Support
+          - FBE/FDE Decryption
+          - MTP and ADB Support
+          - Multi-language Support
+          
+          **Build Date:** $(date)
+          **Build ID:** ${{ github.run_id }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
